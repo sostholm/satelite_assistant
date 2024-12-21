@@ -5,7 +5,7 @@ import logging
 import subprocess
 import os
 
-URI = os.environ.get("URI", "ws://192.168.0.218:9101")
+URI = os.environ.get("URI", "ws://192.168.0.218:9100")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +20,9 @@ CHUNK = int(MIC_RATE * CHUNK_DURATION_MS / 1000)
 
 async def listen(websocket):
     p = pyaudio.PyAudio()
+    for i in range(p.get_device_count()):
+        dev_info = p.get_device_info_by_index(i)
+        print(f"Device {i}: {dev_info['name']} (max input channels={dev_info['maxInputChannels']})")
     loop = asyncio.get_running_loop()
     logger.info("Listening...")
 
@@ -38,6 +41,7 @@ async def listen(websocket):
         rate=MIC_RATE,
         input=True,
         frames_per_buffer=CHUNK,
+        input_device_index=2,
         stream_callback=callback
     )
 
@@ -108,8 +112,13 @@ async def speak(websocket):
         logger.info("Speaker process closed.")
 
 async def main():
-    async with websockets.connect(URI) as websocket:
-        await asyncio.gather(listen(websocket), speak(websocket))
+    while True:
+        async with websockets.connect(URI) as websocket:
+            await asyncio.gather(listen(websocket), speak(websocket))
+        
+        logger.info("Connection closed, retrying in 5 seconds...")
+        await asyncio.sleep(5)
+        
 
 if __name__ == "__main__":
     asyncio.run(main())
