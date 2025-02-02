@@ -6,6 +6,7 @@ import subprocess
 import os
 
 URI = os.environ.get("URI", "ws://192.168.0.218:9100")
+DEVICE_INDEX = int(os.environ.get("DEVICE_INDEX", 2))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -41,7 +42,7 @@ async def listen(websocket):
         rate=MIC_RATE,
         input=True,
         frames_per_buffer=CHUNK,
-        input_device_index=2,
+        input_device_index=DEVICE_INDEX,
         stream_callback=callback
     )
 
