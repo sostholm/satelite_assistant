@@ -2,3 +2,4 @@
 .vscode
 test.py
 zeroconf_test.py
+.env
