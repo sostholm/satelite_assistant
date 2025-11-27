@@ -3,3 +3,4 @@ requests
 livekit==1.0.19
 pulsectl-asyncio
 pycaw
+webrtcvad

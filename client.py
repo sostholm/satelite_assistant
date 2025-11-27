@@ -1,21 +1,24 @@
 import asyncio
+import collections
 import logging
 import os
 import sys
+import queue
 from typing import Dict
 
 import pyaudio
 import requests
+import webrtcvad
 from livekit import rtc
 
 try:
     import pulsectl_asyncio
-except ImportError:
+except Exception:
     pulsectl_asyncio = None
 
 try:
     from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
-except ImportError:
+except Exception:
     AudioUtilities = None
     ISimpleAudioVolume = None
 
@@ -41,6 +44,22 @@ SAMPLE_RATE = 16000  # matches your existing MIC_RATE
 SPEAKER_SAMPLE_RATE = 24000  # Higher quality for TTS
 CHUNK_MS = 20
 SAMPLES_PER_CHUNK = SAMPLE_RATE * CHUNK_MS // 1000
+SPEAKER_SAMPLES_PER_CHUNK = SPEAKER_SAMPLE_RATE * CHUNK_MS // 1000
+
+# Local VAD tuning (WebRTC VAD ranges from 0-3, 3 is most aggressive)
+VAD_MODE = int(os.environ.get("SATELLITE_VAD_MODE", 2))
+SPEECH_TRIGGER_DURATION_MS = int(os.environ.get("SATELLITE_SPEECH_TRIGGER_MS", 300))
+SILENCE_DETECT_DURATION_MS = int(os.environ.get("SATELLITE_SILENCE_TRIGGER_MS", 400))
+SPEECH_TRIGGER_FRAMES = max(1, SPEECH_TRIGGER_DURATION_MS // CHUNK_MS)
+SILENCE_DETECT_FRAMES = max(1, SILENCE_DETECT_DURATION_MS // CHUNK_MS)
+SPEECH_TRIGGER_THRESHOLD = float(
+    os.environ.get("SATELLITE_SPEECH_TRIGGER_THRESHOLD", 0.9)
+)
+SILENCE_DETECT_THRESHOLD = float(
+    os.environ.get("SATELLITE_SILENCE_TRIGGER_THRESHOLD", 0.8)
+)
+MAX_SPEECH_DURATION_MS = int(os.environ.get("SATELLITE_MAX_SPEECH_MS", 4000))
+MAX_SPEECH_FRAMES = max(1, MAX_SPEECH_DURATION_MS // CHUNK_MS)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("satellite-livekit")
@@ -254,29 +273,96 @@ async def publish_mic(room: rtc.Room, shutdown_event: asyncio.Event) -> None:
     await room.local_participant.publish_track(track, options)
     logger.info("Published mic track to room")
 
+    vad = webrtcvad.Vad(VAD_MODE)
+    trigger_buffer: collections.deque = collections.deque(maxlen=SPEECH_TRIGGER_FRAMES)
+    silence_buffer: collections.deque = collections.deque(maxlen=SILENCE_DETECT_FRAMES)
+    triggered = False
+    speech_frame_count = 0
+
+    async def send_frame_bytes(raw_bytes: bytes) -> bool:
+        """Helper to wrap raw PCM bytes into an AudioFrame and send to LiveKit."""
+        if not raw_bytes:
+            return True
+
+        samples_per_channel = len(raw_bytes) // (2 * CHANNELS)
+        if samples_per_channel <= 0:
+            return True
+
+        try:
+            frame = rtc.AudioFrame(
+                data=raw_bytes,
+                sample_rate=SAMPLE_RATE,
+                num_channels=CHANNELS,
+                samples_per_channel=samples_per_channel,
+            )
+        except ValueError as e:
+            logger.error("Invalid audio frame size: %s", e)
+            return True
+
+        try:
+            await source.capture_frame(frame)
+            return True
+        except Exception as e:
+            logger.error("Error capturing frame into LiveKit: %s", e)
+            shutdown_event.set()
+            return False
+
     try:
         while not shutdown_event.is_set() and room.isconnected():
             data = await mic_queue.get()
-            # Bytes -> AudioFrame (16-bit signed PCM)
-            samples_per_channel = len(data) // (2 * CHANNELS)
 
             try:
-                frame = rtc.AudioFrame(
-                    data=data,
-                    sample_rate=SAMPLE_RATE,
-                    num_channels=CHANNELS,
-                    samples_per_channel=samples_per_channel,
-                )
-            except ValueError as e:
-                logger.error("Invalid audio frame size: %s", e)
+                is_speech = vad.is_speech(data, SAMPLE_RATE)
+            except Exception as e:
+                logger.warning("VAD error on satellite client: %s", e)
+                is_speech = False
+
+            if not triggered:
+                trigger_buffer.append((data, is_speech))
+                if len(trigger_buffer) == trigger_buffer.maxlen:
+                    num_voiced = sum(1 for _, speech in trigger_buffer if speech)
+                    if num_voiced >= SPEECH_TRIGGER_THRESHOLD * len(trigger_buffer):
+                        triggered = True
+                        speech_frame_count = 0
+                        logger.debug("[VAD] Speech detected locally, streaming frames.")
+                        # Flush buffered audio so we don't clip the start of speech
+                        for buffered_data, _ in trigger_buffer:
+                            speech_frame_count += 1
+                            if not await send_frame_bytes(buffered_data):
+                                break
+                        if shutdown_event.is_set():
+                            break
+                        trigger_buffer.clear()
+                        silence_buffer.clear()
                 continue
 
-            try:
-                await source.capture_frame(frame)
-            except Exception as e:
-                logger.error("Error capturing frame into LiveKit: %s", e)
-                shutdown_event.set()
+            # Already streaming speech
+            speech_frame_count += 1
+            if not await send_frame_bytes(data):
                 break
+            if shutdown_event.is_set():
+                break
+
+            silence_buffer.append(is_speech)
+            silence_detected = False
+            if len(silence_buffer) == silence_buffer.maxlen:
+                num_unvoiced = sum(1 for speech in silence_buffer if not speech)
+                if num_unvoiced >= SILENCE_DETECT_THRESHOLD * len(silence_buffer):
+                    silence_detected = True
+
+            max_duration_reached = speech_frame_count >= MAX_SPEECH_FRAMES
+
+            if silence_detected or max_duration_reached:
+                triggered = False
+                speech_frame_count = 0
+                silence_buffer.clear()
+                trigger_buffer.clear()
+                if silence_detected:
+                    logger.debug("[VAD] Silence detected locally, pausing stream.")
+                else:
+                    logger.debug(
+                        "[VAD] Max local speech duration reached, pausing stream."
+                    )
 
     except Exception as e:
         logger.error("Unexpected error in publish_mic: %s", e)
@@ -304,9 +390,9 @@ async def play_remote_audio(
 ) -> None:
     """
     Subscribe to a remote audio track and play it to the local speaker.
+    Uses PyAudio callback mode to ensure non-blocking playback and safe cancellation.
     """
     loop = asyncio.get_running_loop()
-
     pa = pyaudio.PyAudio()
 
     output_device_index = None
@@ -319,14 +405,46 @@ async def play_remote_audio(
                 OUTPUT_DEVICE_INDEX,
             )
 
+    # Thread-safe queue for passing audio from async loop to PyAudio callback thread
+    audio_queue = queue.Queue()
+
+    # Internal buffer for the callback to handle mismatched chunk sizes
+    internal_buffer = bytearray()
+
+    def stream_callback(in_data, frame_count, time_info, status):
+        nonlocal internal_buffer
+        bytes_needed = frame_count * 2 * CHANNELS  # 16-bit = 2 bytes
+
+        # Fill internal buffer from queue
+        while len(internal_buffer) < bytes_needed:
+            try:
+                chunk = audio_queue.get_nowait()
+                internal_buffer.extend(chunk)
+            except queue.Empty:
+                break
+
+        if len(internal_buffer) >= bytes_needed:
+            data = bytes(internal_buffer[:bytes_needed])
+            del internal_buffer[:bytes_needed]
+            return (data, pyaudio.paContinue)
+        else:
+            # Underrun: pad with silence
+            padding = b"\x00" * (bytes_needed - len(internal_buffer))
+            data = bytes(internal_buffer) + padding
+            internal_buffer.clear()
+            return (data, pyaudio.paContinue)
+
     stream_out = pa.open(
         format=FORMAT,
         channels=CHANNELS,
         rate=SPEAKER_SAMPLE_RATE,
         output=True,
-        frames_per_buffer=SAMPLES_PER_CHUNK,
+        frames_per_buffer=SPEAKER_SAMPLES_PER_CHUNK,
         output_device_index=output_device_index,
+        stream_callback=stream_callback,
     )
+    stream_out.start_stream()
+
     logger.info(
         "Speaker started on device index %s",
         output_device_index if output_device_index is not None else "(default)",
@@ -361,13 +479,8 @@ async def play_remote_audio(
                 # frame.data is memoryview(int16); tobytes() gives raw bytes for PyAudio
                 pcm_bytes = frame.data.tobytes()
 
-                try:
-                    # Run blocking write in executor so we don't block the event loop
-                    await loop.run_in_executor(None, stream_out.write, pcm_bytes)
-                except Exception as e:
-                    logger.error("Error writing to speaker: %s", e)
-                    shutdown_event.set()
-                    break
+                # Push to queue for the callback thread to consume
+                audio_queue.put_nowait(pcm_bytes)
 
             except asyncio.TimeoutError:
                 # No audio for 1 second -> Unduck
@@ -383,6 +496,7 @@ async def play_remote_audio(
         logger.info("Stopping remote audio playback for track %s", track.sid)
         await vol_manager.unduck()
         try:
+            # Stop stream immediately stops the callback
             stream_out.stop_stream()
             stream_out.close()
         except Exception:
@@ -423,6 +537,16 @@ async def run_client() -> None:
         @room.on("track_subscribed")
         def _on_track_subscribed(track, publication, participant):
             if isinstance(track, rtc.RemoteAudioTrack):
+                # Enforce single-stream playback: cancel any existing audio tracks
+                # This prevents overlapping audio if the server sends multiple tracks or reconnects rapidly
+                for sid, t in list(remote_audio_tasks.items()):
+                    logger.warning(
+                        "New track detected. Cancelling existing track %s to prevent overlap.",
+                        sid,
+                    )
+                    t.cancel()
+                    remote_audio_tasks.pop(sid)
+
                 logger.info(
                     "Subscribed to remote audio from participant=%s track_sid=%s",
                     participant.identity,
@@ -444,7 +568,13 @@ async def run_client() -> None:
                 )
                 task = remote_audio_tasks.pop(track.sid, None)
                 if task:
+                    logger.info("Cancelling task for track %s", track.sid)
                     task.cancel()
+                else:
+                    logger.warning(
+                        "No task found for track %s to cancel (already cleaned up?)",
+                        track.sid,
+                    )
 
         try:
             token = fetch_token(ROOM_NAME, IDENTITY)
